@@ -1,4 +1,4 @@
-# go-Futures
+# go-futures
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/GreatValueCreamSoda/go-futures.svg)](https://pkg.go.dev/github.com/GreatValueCreamSoda/go-futures)
 [![Go Report Card](https://goreportcard.com/badge/github.com/GreatValueCreamSoda/go-futuresl)](https://goreportcard.com/report/github.com/GreatValueCreamSoda/go-futures)
