@@ -5,16 +5,33 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A lightweight, generic Future and thread-pool control implementation for Go.
-This package provides an easy way to execute asynchronous computations, chain them together, limit concurrency, coordinate results, and handel concurrent errors or panics.
+This package provides an easy way to execute asynchronous computations, chain them together, limit concurrency, coordinate results, and handle concurrent errors or panics.
+
+## What Is A Future
+A `Future[T]` represents a proxy for a value that isn't necessarily known yet.
+Upon creation via `NewFuture`, a background goroutine is immediately spawned to execute the task.
+The future is monitored via a data-less channel (`chan struct{}`). Calling `.Get()` blocks execution until this channel closes, safely delivering the typed result or error.
+
 
 ## Features
 
-- Generic Futures: Run asynchronous computations with typed results.
-- Thread Pool: Limit concurrency using a pool of goroutines.
-- Chaining: Use `Then` to compose operations.
-- `AsCompleted`: Process results in order of completion.
-- Synchronization: Wait for multiple tasks to finish with WaitForAll.
-- Context Support: Control concurrency with NewFutureWithContext and WithPool.
+- **Generic Futures**: Run asynchronous computations with strongly typed results.
+- **Thread Pool**: Limit concurrency via context-propagated semaphores.
+- **Chaining & Recovery**: Use `Then` to compose operations and `Catch` for error recovery fallback pipelines.
+- **`AsCompleted`**: Process results reactively in the exact order they resolve using Go range-ready iterators.
+- **Synchronization**: Batch-wait for tasks with `WaitForAll` or aggregate values with `All`.
+- **Asynchronous Mapping**: Spin up slices of futures instantly from raw slices using `Map` and `MapWithContext`.
+
+### Panic Recovery
+Asynchronous panics can easily bring down an entire Go runtime.
+This library wraps all internal execution blocks with a deferred recovery function.
+If a user-supplied function panics, the panic is intercepted, converted into a standard Go error, and delivered safely through the `.Get()` method without disrupting other running futures.
+
+### Concurrency Limits via Context
+Instead of forcing you to pass manual workers or channel queues around, concurrency limits are driven implicitly through Go's standard `context.Context`.
+By attaching a `FutureThreadPool` to your context via `WithPool`, any downstream future initiated via `NewFutureWithContext` will automatically acquire and release slots on a channel-based semaphore before executing.
+
+---
 
 ## Installation
 
@@ -78,6 +95,23 @@ if err != nil {
 fmt.Println(res) // Output: Value is 10
 ```
 
+- Error Recovery with `Catch`
+
+```go
+f1 := future.NewFuture(func() (int, error) {
+    return 0, errors.New("something went wrong")
+})
+
+// Catch intercepts the error and provides a fallback value
+f2 := future.Catch(f1, func(err error) (int, error) {
+    fmt.Println("Recovered from error:", err)
+    return 100, nil
+})
+
+res, _ := f2.Get()
+fmt.Println("Fallback Result:", res) // Output: 100
+```
+
 - Processing tasks as they finish
 
 ```go
@@ -93,6 +127,37 @@ iter(func(f *future.Future[int]) bool {
     fmt.Println("Completed:", res)
     return true
 })
+```
+
+- Combining Futures with `All`
+
+```go
+f1 := future.NewFuture(func() (int, error) { return 10, nil })
+f2 := future.NewFuture(func() (int, error) { return 20, nil })
+
+combined := future.All(f1, f2)
+results, err := combined.Get()
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(results) // Output: [10, 20]
+// Note: If ANY future fails, All fails immediately with that error.
+```
+
+- Asynchronous Mapping with `Map`
+
+```go
+items := []int{1, 2, 3, 4, 5}
+
+// Automatically processes the items concurrently using futures
+futures := future.Map(items, func(n int) (int, error) {
+    return n * 2, nil
+})
+
+for _, f := range futures {
+    res, _ := f.Get()
+    fmt.Println(res)
+}
 ```
 
 ## When to use
