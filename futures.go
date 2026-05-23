@@ -66,9 +66,9 @@ func (p *FutureThreadPool) acquire() { p.sem <- struct{}{} }
 // computation completes, ensuring proper resource cleanup.
 func (p *FutureThreadPool) release() { <-p.sem }
 
-// Future represents an asynchronous computation that will eventually produce
-// a value of type T or an error. Providing a way to track the completion of
-// a task and retrieve its result when ready.
+// Future represents an asynchronous computation that will eventually produce a
+// value of type T or an error. Providing a way to track the completion of a
+// task and retrieve its result when ready.
 type Future[T any] struct {
 	done chan struct{}
 	res  T
@@ -80,14 +80,53 @@ type Future[T any] struct {
 //
 // The function fn is run in a separate goroutine, and the Future is marked as
 // done when the computation completes, whether successfully or with an error.
-// This is typically used to initiate asynchronous tasks whose results can be
-// retrieved later.
+// This is typically used to initiate an asynchronous tasks whose results will
+// be accesed at an undetermined time in the future.
 func NewFuture[T any](fn func() (T, error)) *Future[T] {
 	f := &Future[T]{done: make(chan struct{})}
 
-	go runFuture(fn, f)
+	go runFuture(context.Background(), fn, f)
 
 	return f
+}
+
+// NewFutureWithContext is identical to NewFuture but executes a future with a
+// given context.
+//
+// The function WithPool can be used to specify the maximum number of
+// concurrent futures that can run at the same time within a context. Useful
+// for limiting the amount of cpu usage or amount of concurrent web requests.
+// NewFutureWithContext can only prevent a future from executing if a context is
+// closed. It cannot stop an already running future if a context is closed after
+// it's started.
+func NewFutureWithContext[T any](
+	ctx context.Context, fn func() (T, error)) *Future[T] {
+	f := &Future[T]{done: make(chan struct{})}
+
+	go runFuture(ctx, fn, f)
+
+	return f
+}
+
+// runFuture executes the given function and stores the results in the passed
+// future.
+func runFuture[T any](ctx context.Context, fn func() (T, error), f *Future[T]) {
+	if pool := poolFromContext(ctx); pool != nil {
+		pool.acquire()
+		defer pool.release()
+	}
+	var zero T
+	if err := ctx.Err(); err != nil {
+		f.res, f.err = zero, err
+		return
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			f.err = fmt.Errorf("panic in future: %v", rec)
+		}
+		close(f.done)
+	}()
+	f.res, f.err = fn()
 }
 
 // Done returns a channel that is closed when the Future's computation
@@ -108,44 +147,6 @@ func (f *Future[T]) Get() (T, error) {
 	return f.res, f.err
 }
 
-// NewFutureWithContext is identical to NewFuture but executes a future with a
-// given context.
-//
-// The function WithPool can be used to specify the maximum number of
-// concurrent futures that can run at the same time within a context. Useful
-// for limiting the amount of cpu usage or amount of concurrent web requests.
-func NewFutureWithContext[T any](
-	ctx context.Context, fn func() (T, error)) *Future[T] {
-	f := &Future[T]{done: make(chan struct{})}
-
-	go runFutureWithContext(ctx, fn, f)
-
-	return f
-}
-
-// runFuture executes the given function and stores the results in the passed
-// future.
-func runFuture[T any](fn func() (T, error), f *Future[T]) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			f.err = fmt.Errorf("panic in future: %v", rec)
-		}
-		close(f.done)
-	}()
-	f.res, f.err = fn()
-}
-
-// runFutureWithContext is identical to runFuture but executes a future with a
-// context, typically for limiting the total number of concurrent workers.
-func runFutureWithContext[T any](
-	ctx context.Context, fn func() (T, error), f *Future[T]) {
-	if pool := poolFromContext(ctx); pool != nil {
-		pool.acquire()
-		defer pool.release()
-	}
-	runFuture(fn, f)
-}
-
 // Then creates a new Future that applies the provided function to the result
 // of an existing Future.
 //
@@ -164,6 +165,20 @@ func Then[T1, T2 any](f *Future[T1], fn func(T1) (T2, error)) *Future[T2] {
 	}
 
 	return NewFuture(newFutureFn)
+}
+
+// Catch intercepts an error from a preceding Future and runs a recovery
+// function to provide a fallback value.
+//
+// If the preceding Future succeeded, Catch passes the result through untouched.
+func Catch[T any](f *Future[T], recoveryFn func(error) (T, error)) *Future[T] {
+	return NewFuture(func() (T, error) {
+		res, err := f.Get()
+		if err != nil {
+			return recoveryFn(err)
+		}
+		return res, nil
+	})
 }
 
 // AsCompleted creates an iterator that yields completed Futures in the order
@@ -204,4 +219,49 @@ func WaitForAll[T any](futures ...*Future[T]) {
 	for _, f := range futures {
 		<-f.Done()
 	}
+}
+
+// All combines a slice of Futures into a single Future that returns a slice of
+// all results.
+//
+// If ANY future fails, this combined future fails immediately with that error.
+func All[T any](futures ...*Future[T]) *Future[[]T] {
+	return NewFuture(func() ([]T, error) {
+		results := make([]T, len(futures))
+
+		for i, f := range futures {
+			res, err := f.Get()
+			if err != nil {
+				var zero []T
+				return zero, err
+			}
+			results[i] = res
+		}
+
+		return results, nil
+	})
+}
+
+// Map schedules a function to be applied to each item in an input slice using
+// futures to run them asynchronously.
+//
+// It returns a slice of unresolved Futures immediately.
+func Map[I any, O any](items []I, fn func(I) (O, error)) []*Future[O] {
+	return MapWithContext(context.Background(), items, fn)
+}
+
+// MapWithContext is identical to Map but accepts a context that will be passed
+// to every created future.
+func MapWithContext[I any, O any](ctx context.Context, items []I,
+	fn func(I) (O, error)) []*Future[O] {
+	futures := make([]*Future[O], len(items))
+
+	for i, item := range items {
+		currItem := item
+		futures[i] = NewFutureWithContext(ctx, func() (O, error) {
+			return fn(currItem)
+		})
+	}
+
+	return futures
 }

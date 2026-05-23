@@ -242,3 +242,81 @@ func TestWaitForAll(t *testing.T) {
 		t.Errorf("Expected result 0, got %v", res2)
 	}
 }
+
+// A tiny, predictable function to minimize workload variance.
+// We use a sink to prevent the Go compiler from optimizing away the call.
+var resultSink int
+
+func workFunc() (int, error) {
+	return 42, nil
+}
+
+// 1. Baseline: Pure synchronous function execution
+func BenchmarkBaseline_DirectCall(b *testing.B) {
+	var r int
+	for i := 0; i < b.N; i++ {
+		r, _ = workFunc()
+	}
+	resultSink = r
+}
+
+// 2. Baseline: Raw goroutine + channel sync (No library overhead)
+func BenchmarkBaseline_RawGoroutine(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		done := make(chan struct{})
+		var r int
+		go func() {
+			r, _ = workFunc()
+			close(done)
+		}()
+		<-done
+		resultSink = r
+	}
+}
+
+// 3. Baseline: Raw goroutine + semaphore (Simulating a pool)
+func BenchmarkBaseline_RawPoolGoroutine(b *testing.B) {
+	sem := make(chan struct{}, 10)
+	for i := 0; i < b.N; i++ {
+		sem <- struct{}{}
+		done := make(chan struct{})
+		var r int
+		go func() {
+			defer func() { <-sem }()
+			r, _ = workFunc()
+			close(done)
+		}()
+		<-done
+		resultSink = r
+	}
+}
+
+// 4. Future: Standard asynchronous abstraction
+func BenchmarkFuture_NewFuture(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		f := future.NewFuture(workFunc)
+		r, _ := f.Get()
+		resultSink = r
+	}
+}
+
+// 5. Future: Context-based abstraction (No pool active)
+func BenchmarkFuture_WithContextNoPool(b *testing.B) {
+	ctx := context.Background()
+	for i := 0; i < b.N; i++ {
+		f := future.NewFutureWithContext(ctx, workFunc)
+		r, _ := f.Get()
+		resultSink = r
+	}
+}
+
+// 6. Future: Context-based abstraction (With pool context active)
+func BenchmarkFuture_WithContextAndPool(b *testing.B) {
+	pool := future.NewPool(10)
+	ctx := future.WithPool(context.Background(), pool)
+	for i := 0; i < b.N; i++ {
+		f := future.NewFutureWithContext(ctx, workFunc)
+		r, _ := f.Get()
+		resultSink = r
+	}
+}
