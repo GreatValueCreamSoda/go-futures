@@ -85,9 +85,48 @@ type Future[T any] struct {
 func NewFuture[T any](fn func() (T, error)) *Future[T] {
 	f := &Future[T]{done: make(chan struct{})}
 
-	go runFuture(fn, f)
+	go runFuture(context.Background(), fn, f)
 
 	return f
+}
+
+// NewFutureWithContext is identical to NewFuture but executes a future with a
+// given context.
+//
+// The function WithPool can be used to specify the maximum number of
+// concurrent futures that can run at the same time within a context. Useful
+// for limiting the amount of cpu usage or amount of concurrent web requests.
+// NewFutureWithContext can only prevent a future from executing if a context is
+// closed. It cannot stop an already running future if a context is closed after
+// it's started.
+func NewFutureWithContext[T any](
+	ctx context.Context, fn func() (T, error)) *Future[T] {
+	f := &Future[T]{done: make(chan struct{})}
+
+	go runFuture(ctx, fn, f)
+
+	return f
+}
+
+// runFuture executes the given function and stores the results in the passed
+// future.
+func runFuture[T any](ctx context.Context, fn func() (T, error), f *Future[T]) {
+	if pool := poolFromContext(ctx); pool != nil {
+		pool.acquire()
+		defer pool.release()
+	}
+	var zero T
+	if err := ctx.Err(); err != nil {
+		f.res, f.err = zero, err
+		return
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			f.err = fmt.Errorf("panic in future: %v", rec)
+		}
+		close(f.done)
+	}()
+	f.res, f.err = fn()
 }
 
 // Done returns a channel that is closed when the Future's computation
@@ -106,44 +145,6 @@ func (f *Future[T]) Done() <-chan struct{} { return f.done }
 func (f *Future[T]) Get() (T, error) {
 	<-f.Done()
 	return f.res, f.err
-}
-
-// NewFutureWithContext is identical to NewFuture but executes a future with a
-// given context.
-//
-// The function WithPool can be used to specify the maximum number of
-// concurrent futures that can run at the same time within a context. Useful
-// for limiting the amount of cpu usage or amount of concurrent web requests.
-func NewFutureWithContext[T any](
-	ctx context.Context, fn func() (T, error)) *Future[T] {
-	f := &Future[T]{done: make(chan struct{})}
-
-	go runFutureWithContext(ctx, fn, f)
-
-	return f
-}
-
-// runFuture executes the given function and stores the results in the passed
-// future.
-func runFuture[T any](fn func() (T, error), f *Future[T]) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			f.err = fmt.Errorf("panic in future: %v", rec)
-		}
-		close(f.done)
-	}()
-	f.res, f.err = fn()
-}
-
-// runFutureWithContext is identical to runFuture but executes a future with a
-// context, typically for limiting the total number of concurrent workers.
-func runFutureWithContext[T any](
-	ctx context.Context, fn func() (T, error), f *Future[T]) {
-	if pool := poolFromContext(ctx); pool != nil {
-		pool.acquire()
-		defer pool.release()
-	}
-	runFuture(fn, f)
 }
 
 // Then creates a new Future that applies the provided function to the result
